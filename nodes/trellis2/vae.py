@@ -525,10 +525,12 @@ class SparseResBlockC2S3d(nn.Module):
         self.updown = sp.SparseChannel2Spatial(2)
 
     def _forward(self, x: sp.SparseTensor, subdiv: sp.SparseTensor = None) -> sp.SparseTensor:
+        _ma = torch.cuda.memory_allocated
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
         h = x.replace(self.norm1(x.feats))
         h = h.replace(F.silu(h.feats))
+        print(f"[C2S3d] pre-conv1: N={h.feats.shape[0]:,} Ci={h.feats.shape[1]} Co={self.out_channels*8} alloc={_ma()//1048576}MB", flush=True)
         h = self.conv1(h)
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
@@ -537,14 +539,23 @@ class SparseResBlockC2S3d(nn.Module):
         # Free conv1/C2S spatial caches before conv2 builds its own
         h.clear_spatial_cache()
         x.clear_spatial_cache()
+        print(f"[C2S3d] post-C2S: N={h.feats.shape[0]:,} h={h.feats.shape[1]}ch x={x.feats.shape[1]}ch alloc={_ma()//1048576}MB", flush=True)
+        # Offload x to CPU during conv2 — only needed for skip after
+        x_feats_cpu = x.feats.to('cpu', non_blocking=True)
+        del x
+        torch.cuda.current_stream().synchronize()
+        print(f"[C2S3d] x offloaded to CPU, pre-conv2: alloc={_ma()//1048576}MB", flush=True)
         h = h.replace(self.norm2(h.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv2(h)
-        # Fused skip: inline repeat_interleave + add, free x early
-        skip_feats = x.feats.repeat_interleave(self.out_channels // (self.channels // 8), dim=1)
-        del x
+        h.clear_spatial_cache()  # Free conv2 neighbor cache before skip allocation
+        print(f"[C2S3d] post-conv2 (cache cleared): alloc={_ma()//1048576}MB", flush=True)
+        # Fused skip: bring x back from CPU, repeat_interleave + add
+        skip_feats = x_feats_cpu.to(h.feats.device).repeat_interleave(self.out_channels // (self.channels // 8), dim=1)
+        del x_feats_cpu
         h = h.replace(h.feats + skip_feats)
         del skip_feats
+        print(f"[C2S3d] post-skip: alloc={_ma()//1048576}MB", flush=True)
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -583,6 +594,8 @@ class SparseConvNeXtBlock3d(nn.Module):
         h = self.conv(x)
         norm_feats = self.norm(h.feats)
         del h  # free conv output feats before MLP expansion
+        if self.low_vram:
+            x.clear_spatial_cache()  # Free neighbor cache during MLP (rebuilt next block)
         steps = max(1, (norm_feats.shape[0] + self.mlp_chunk_size - 1) // self.mlp_chunk_size) if self.low_vram else 1
         while True:
             try:
@@ -806,10 +819,13 @@ class SparseUnetVaeDecoder(nn.Module):
         pbar = comfy.utils.ProgressBar(total_blocks + 1)
 
         h = self.from_latent(x)
+        _ma = torch.cuda.memory_allocated
 
         subs = []
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
+                _bname = block.__class__.__name__
+                print(f"[UNET] level={i} block={j} {_bname} N={h.feats.shape[0]:,} ch={h.feats.shape[1]} alloc={_ma()//1048576}MB", flush=True)
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
                     if self.pred_subdiv:
                         h, sub = block(h)
