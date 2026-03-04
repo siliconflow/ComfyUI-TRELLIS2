@@ -14,12 +14,15 @@ import comfy.model_management
 
 
 def _log_vram(label):
+    import sys
     import torch
     if torch.cuda.is_available():
         alloc = torch.cuda.memory_allocated() / 1024**2
         reserved = torch.cuda.memory_reserved() / 1024**2
         peak = torch.cuda.max_memory_allocated() / 1024**2
-        logger.info(f"[VRAM] {label}: alloc={alloc:.0f}MB reserved={reserved:.0f}MB peak={peak:.0f}MB")
+        msg = f"[VRAM] {label}: alloc={alloc:.0f}MB reserved={reserved:.0f}MB peak={peak:.0f}MB"
+        logger.info(msg)
+        print(msg, file=sys.stderr, flush=True)
 
 
 

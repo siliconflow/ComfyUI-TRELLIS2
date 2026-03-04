@@ -533,10 +533,18 @@ class SparseResBlockC2S3d(nn.Module):
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
+        del subdiv_binarized
+        # Free conv1/C2S spatial caches before conv2 builds its own
+        h.clear_spatial_cache()
+        x.clear_spatial_cache()
         h = h.replace(self.norm2(h.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        # Fused skip: inline repeat_interleave + add, free x early
+        skip_feats = x.feats.repeat_interleave(self.out_channels // (self.channels // 8), dim=1)
+        del x
+        h = h.replace(h.feats + skip_feats)
+        del skip_feats
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -795,34 +803,31 @@ class SparseUnetVaeDecoder(nn.Module):
 
         import comfy.utils
         total_blocks = sum(len(res) for res in self.blocks)
-        pbar = comfy.utils.ProgressBar(total_blocks + 1)  # +1 for output layer
+        pbar = comfy.utils.ProgressBar(total_blocks + 1)
 
         h = self.from_latent(x)
-        subs_gt = []
+
         subs = []
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
                     if self.pred_subdiv:
-                        if self.training:
-                            subs_gt.append(h.get_spatial_cache('subdivision'))
                         h, sub = block(h)
                         subs.append(sub)
                     else:
                         h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
+                    h.clear_spatial_cache()
                 else:
                     h = block(h)
                 pbar.update(1)
+
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.output_layer(h)
+
         pbar.update(1)
-        if self.training and self.pred_subdiv:
-            return h, subs_gt, subs
-        else:
-            if return_subs:
-                return h, subs
-            else:
-                return h
+        if return_subs:
+            return h, subs
+        return h
 
     def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
         assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
@@ -1065,12 +1070,31 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         decoded = super().forward(x, **kwargs)
         out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
         h = out_list[0]
+
+        # Free sparse conv caches and input tensor
+        h.clear_spatial_cache()
+        x.clear_spatial_cache()
+        for item in out_list[1:]:
+            if isinstance(item, (list, tuple)):
+                for sub in item:
+                    if hasattr(sub, 'clear_spatial_cache'):
+                        sub.clear_spatial_cache()
+            elif hasattr(item, 'clear_spatial_cache'):
+                item.clear_spatial_cache()
+        del x
+        torch.cuda.empty_cache()
+
+        # Extract the 7 output channels with activations, free h
+        coords = h.coords[:, 1:]
         vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
         intersected = h.replace(h.feats[..., 3:6] > 0)
         quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+        extra = out_list[1:]
+        del h, out_list
+
         if self.use_vb:
             mesh = [Mesh(*_tiled_vb(
-                coords=h.coords[:, 1:],
+                coords=coords,
                 dual_vertices=v.feats,
                 intersected_flag=i.feats,
                 split_weight=q.feats,
@@ -1083,7 +1107,7 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
             if _flex_upstream is None:
                 raise ImportError("o_voxel is not installed — cannot use upstream decoder")
             mesh = [Mesh(*_flex_upstream(
-                coords=h.coords[:, 1:],
+                coords=coords,
                 dual_vertices=v.feats,
                 intersected_flag=i.feats,
                 split_weight=q.feats,
@@ -1091,5 +1115,9 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
                 grid_size=self.resolution,
                 train=False,
             )) for v, i, q in zip(vertices, intersected, quad_lerp)]
-        out_list[0] = mesh
-        return out_list[0] if len(out_list) == 1 else tuple(out_list)
+
+        del coords, vertices, intersected, quad_lerp
+
+        if extra:
+            return (mesh, *extra)
+        return mesh

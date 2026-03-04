@@ -9,6 +9,7 @@ import gc
 import json
 import logging
 import os
+import sys
 from fractions import Fraction
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -88,11 +89,9 @@ def _encode_mesh_to_shape_slat(vertices, faces, resolution, device):
     Returns:
         shape_slat SparseTensor
     """
-    import time as _time, sys as _sys
     from .trellis2.sparse import SparseTensor
     import o_voxel
 
-    t0 = _time.perf_counter()
     voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
         vertices.cpu(),
         faces.cpu(),
@@ -102,8 +101,6 @@ def _encode_mesh_to_shape_slat(vertices, faces, resolution, device):
         boundary_weight=0.2,
         regularization_weight=1e-2,
     )
-    print(f"[TRELLIS2] mesh_to_flexible_dual_grid: {_time.perf_counter()-t0:.1f}s, "
-          f"{voxel_indices.shape[0]} voxels", file=_sys.stderr)
 
     # Build SparseTensor inputs for the encoder
     # feats = vertex offsets within each voxel cell
@@ -122,9 +119,7 @@ def _encode_mesh_to_shape_slat(vertices, faces, resolution, device):
     intersected_feats = intersected.to(device=device, dtype=model_dtype)
     intersected_sparse = SparseTensor(feats=intersected_feats, coords=coords)
 
-    t0 = _time.perf_counter()
     shape_slat = encoder(vertices_sparse, intersected_sparse, sample_posterior=False)
-    print(f"[TRELLIS2] Shape encoder: {_time.perf_counter()-t0:.1f}s", file=_sys.stderr)
 
     del vertices_sparse, intersected_sparse, vertex_feats, intersected_feats, coords
     _unload_model('shape_slat_encoder')
@@ -552,6 +547,7 @@ def _sample_shape_slat_cascade(
     # ---- Upsample via decoder ----
     comfy.model_management.throw_exception_if_processing_interrupted()
     decoder = _load_model('shape_slat_decoder')
+    decoder.low_vram = True
     model_dtype = next(decoder.parameters()).dtype
     slat = slat.replace(feats=slat.feats.to(dtype=model_dtype))
     hr_coords = decoder.upsample(slat, upsample_times=4)
@@ -617,17 +613,15 @@ def _sample_shape_slat_cascade(
 
 def _decode_shape_slat(slat, resolution, dtype, use_vb=True):
     """Decode structured latent -> meshes + subs."""
-    import time as _time, sys as _sys
     comfy.model_management.throw_exception_if_processing_interrupted()
     decoder = _load_model('shape_slat_decoder')
     decoder.set_resolution(resolution)
     decoder.use_vb = use_vb
+    decoder.low_vram = True  # Enable MLP chunking to reduce VRAM peak
     model_dtype = next(decoder.parameters()).dtype
     slat = slat.replace(feats=slat.feats.to(dtype=model_dtype))
 
-    t0 = _time.perf_counter()
     meshes, subs = decoder(slat, return_subs=True)
-    print(f"[TRELLIS2] Shape decode (FlexiDualGridVaeDecoder): {_time.perf_counter()-t0:.1f}s", file=_sys.stderr)
 
     _unload_model('shape_slat_decoder')
     return meshes, subs
@@ -693,9 +687,9 @@ def _decode_tex_slat(slat, subs=None):
         subs: optional subdivision guides from shape decode. When None,
               the decoder runs without guide_subs (standalone texturing path).
     """
-    import time as _time, sys as _sys
     comfy.model_management.throw_exception_if_processing_interrupted()
     decoder = _load_model('tex_slat_decoder')
+    decoder.low_vram = True  # Enable MLP chunking to reduce VRAM peak
     model_dtype = next(decoder.parameters()).dtype
     slat = slat.replace(feats=slat.feats.to(dtype=model_dtype))
 
@@ -705,11 +699,8 @@ def _decode_tex_slat(slat, subs=None):
             subs[i] = sub.replace(feats=sub.feats.to(dtype=model_dtype))
         kwargs['guide_subs'] = subs
 
-    t0 = _time.perf_counter()
     ret = decoder(slat, **kwargs) * 0.5 + 0.5
     ret = ret.replace(feats=ret.feats.float())
-    label = "with guide_subs" if subs is not None else "no guide_subs"
-    print(f"[TRELLIS2] Texture decode ({label}): {_time.perf_counter()-t0:.1f}s", file=_sys.stderr)
 
     _unload_model('tex_slat_decoder')
     return ret
@@ -804,34 +795,23 @@ def run_conditioning(
     pil_image = smart_crop_square(pil_image, alpha_np, margin_ratio=0.1, background_color=bg_color)
 
     # Load (or reuse cached) DinoV3 via ComfyUI ModelPatcher
-    import time as _time
-    import sys as _sys
-
     comfy.model_management.throw_exception_if_processing_interrupted()
 
-    t0 = _time.perf_counter()
     dinov3_model = _load_dinov3(device)
-    print(f"[TRELLIS2] DinoV3 load: {_time.perf_counter()-t0:.1f}s", file=_sys.stderr)
 
     # Get 512px conditioning
     dinov3_model.image_size = 512
-    t0 = _time.perf_counter()
     cond_512 = dinov3_model([pil_image])
-    print(f"[TRELLIS2] DinoV3 512px extract: {_time.perf_counter()-t0:.1f}s", file=_sys.stderr)
     pbar.update(1)
 
     # Get 1024px conditioning only if caller requested it AND pipeline has cascade model
     cond_1024 = None
     if include_1024 and _has_cascade_model():
         dinov3_model.image_size = 1024
-        t0 = _time.perf_counter()
         cond_1024 = dinov3_model([pil_image])
-        print(f"[TRELLIS2] DinoV3 1024px extract: {_time.perf_counter()-t0:.1f}s", file=_sys.stderr)
     pbar.update(1)
 
-    t0 = _time.perf_counter()
     comfy.model_management.soft_empty_cache()
-    print(f"[TRELLIS2] soft_empty_cache: {_time.perf_counter()-t0:.1f}s", file=_sys.stderr)
     pbar.update(1)
 
     # Create negative conditioning
@@ -993,6 +973,11 @@ def run_shape_generation(
         'raw_mesh_vertices': raw_mesh_vertices,
         'raw_mesh_faces': raw_mesh_faces,
     }
+
+    # Free GPU refs from locals that are now serialized
+    del shape_slat, subs, meshes, mesh
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
 
     pbar.update(1)
     log.info(f"Shape generated: {len(vertices)} verts, {len(faces)} faces")
@@ -1376,6 +1361,7 @@ def run_refine_mesh(
     # Step 1: Upsample via shape_slat_decoder to get HR coordinates
     comfy.model_management.throw_exception_if_processing_interrupted()
     decoder = _load_model('shape_slat_decoder')
+    decoder.low_vram = True
     model_dtype = next(decoder.parameters()).dtype
     mesh_slat_cast = mesh_slat.replace(feats=mesh_slat.feats.to(dtype=model_dtype))
     hr_coords = decoder.upsample(mesh_slat_cast, upsample_times=4)
