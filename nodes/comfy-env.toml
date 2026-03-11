@@ -1,5 +1,5 @@
 [cuda]
-packages = ["nvdiffrast", "flex_gemm", "flex_gemm_ap", "cumesh", "o_voxel", "o_voxel_vb", "nvdiffrec_render", "torch", "torchvision", "flash-attn", "sageattention"]
+packages = ["nvdiffrast", "flex_gemm", "flex_gemm_ap", "cumesh", "o_voxel", "o_voxel_vb", "nvdiffrec_render", "torch", "torchvision", "flash-attn", "sageattention", "pytorch3d"]
 
 [pypi-dependencies]
 # HuggingFace models
@@ -34,6 +34,9 @@ numpy = ">=1.21.0"
 easydict = "*"
 tqdm = "*"
 plyfile = "*"
+
+[env_vars]
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 
 [target.linux-64.pypi-dependencies]
 triton = ">=3.0.0"

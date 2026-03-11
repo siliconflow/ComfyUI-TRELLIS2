@@ -302,6 +302,7 @@ Parameters:
                 io.Custom("TRIMESH").Input("trimesh"),
                 io.Custom("TRELLIS2_VOXELGRID").Input("voxelgrid"),
                 io.Int.Input("texture_size", default=2048, min=512, max=16384, step=512),
+                io.Boolean.Input("use_pytorch3d", default=False),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="trimesh"),
@@ -314,11 +315,11 @@ Parameters:
         trimesh,
         voxelgrid,
         texture_size=2048,
+        use_pytorch3d=False,
     ):
         import torch
         import cv2
         import cumesh as CuMesh
-        import nvdiffrast.torch as dr
         from flex_gemm.ops.grid_sample import grid_sample_3d
         import trimesh as Trimesh
 
@@ -389,39 +390,80 @@ Parameters:
 
         logger.info("Rasterizing in UV space...")
 
-        # Setup nvdiffrast
-        ctx = dr.RasterizeCudaContext()
+        if use_pytorch3d:
+            from pytorch3d.structures import Meshes
+            from pytorch3d.renderer.mesh.rasterize_meshes import rasterize_meshes
 
-        # Prepare UVs for rasterization
-        uvs_rast = torch.cat([
-            uvs * 2 - 1,
-            torch.zeros_like(uvs[:, :1]),
-            torch.ones_like(uvs[:, :1])
-        ], dim=-1).unsqueeze(0)
+            # UV-space vertices: treat UVs as 2D positions with z=0
+            verts_uv = torch.cat([uvs * 2 - 1, torch.zeros_like(uvs[:, :1])], dim=-1).float()
 
-        rast = torch.zeros((1, texture_size, texture_size, 4), device=device, dtype=torch.float32)
+            rast_mask = torch.zeros(texture_size, texture_size, dtype=torch.bool, device=device)
+            rast_face_ids = torch.full((texture_size, texture_size), -1, dtype=torch.long, device=device)
+            rast_bary = torch.zeros(texture_size, texture_size, 3, dtype=torch.float32, device=device)
 
-        # Rasterize in chunks
-        chunk_size = 100000
-        for i in range(0, faces.shape[0], chunk_size):
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            rast_chunk, _ = dr.rasterize(
-                ctx, uvs_rast, faces[i:i+chunk_size],
-                resolution=[texture_size, texture_size],
-            )
-            mask_chunk = rast_chunk[..., 3:4] > 0
-            rast_chunk[..., 3:4] += i
-            rast = torch.where(mask_chunk, rast_chunk, rast)
-            del rast_chunk, mask_chunk
+            # Rasterize in chunks
+            chunk_size = 100000
+            for i in range(0, faces.shape[0], chunk_size):
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                chunk_faces = faces[i:i+chunk_size].long()
+                meshes = Meshes(verts=[verts_uv], faces=[chunk_faces])
+                pix_to_face, _, bary_coords, _ = rasterize_meshes(
+                    meshes, image_size=texture_size,
+                    faces_per_pixel=1, perspective_correct=False,
+                    cull_backfaces=False,
+                )
+                chunk_hit = pix_to_face[0, :, :, 0] >= 0
+                chunk_face_ids = pix_to_face[0, :, :, 0] + i
+                rast_face_ids = torch.where(chunk_hit, chunk_face_ids, rast_face_ids)
+                rast_bary[chunk_hit] = bary_coords[0, :, :, 0][chunk_hit]
+                rast_mask |= chunk_hit
+                del meshes, pix_to_face, bary_coords, chunk_hit, chunk_face_ids
 
-        del ctx, uvs_rast
-        comfy.model_management.soft_empty_cache()
+            del verts_uv
+            comfy.model_management.soft_empty_cache()
 
-        mask = rast[0, ..., 3] > 0
+            mask = rast_mask
 
-        # Interpolate 3D positions
-        pos = dr.interpolate(vertices_yup.unsqueeze(0), rast, faces)[0][0]
-        valid_pos = pos[mask]
+            # Manual barycentric interpolation (replaces dr.interpolate)
+            face_verts = vertices_yup[faces[rast_face_ids[mask]].long()]  # [N, 3, 3]
+            valid_pos = (face_verts * rast_bary[mask].unsqueeze(-1)).sum(dim=1)
+            del rast_face_ids, rast_bary, rast_mask, face_verts
+        else:
+            import nvdiffrast.torch as dr
+
+            # Setup nvdiffrast
+            ctx = dr.RasterizeCudaContext()
+
+            # Prepare UVs for rasterization
+            uvs_rast = torch.cat([
+                uvs * 2 - 1,
+                torch.zeros_like(uvs[:, :1]),
+                torch.ones_like(uvs[:, :1])
+            ], dim=-1).unsqueeze(0)
+
+            rast = torch.zeros((1, texture_size, texture_size, 4), device=device, dtype=torch.float32)
+
+            # Rasterize in chunks
+            chunk_size = 100000
+            for i in range(0, faces.shape[0], chunk_size):
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                rast_chunk, _ = dr.rasterize(
+                    ctx, uvs_rast, faces[i:i+chunk_size],
+                    resolution=[texture_size, texture_size],
+                )
+                mask_chunk = rast_chunk[..., 3:4] > 0
+                rast_chunk[..., 3:4] += i
+                rast = torch.where(mask_chunk, rast_chunk, rast)
+                del rast_chunk, mask_chunk
+
+            del ctx, uvs_rast
+            comfy.model_management.soft_empty_cache()
+
+            mask = rast[0, ..., 3] > 0
+
+            # Interpolate 3D positions
+            pos = dr.interpolate(vertices_yup.unsqueeze(0), rast, faces)[0][0]
+            valid_pos = pos[mask]
 
         # Map to original mesh
         _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
@@ -434,7 +476,7 @@ Parameters:
         vert_orig_tris = orig_vertices[orig_faces[vert_face_id.long()]]
         vertices_mapped = (vert_orig_tris * vert_uvw.unsqueeze(-1)).sum(dim=1)
 
-        del bvh, face_id, uvw, orig_tri_verts, vert_face_id, vert_uvw, vert_orig_tris, pos, rast, vertices_yup
+        del bvh, face_id, uvw, orig_tri_verts, vert_face_id, vert_uvw, vert_orig_tris, vertices_yup
         comfy.model_management.soft_empty_cache()
 
         # Sample voxel attributes for texture
@@ -530,6 +572,7 @@ def remesh_narrow_band_dc_lowmem(
     vertices, faces, center, scale, resolution,
     band=1, project_back=0, verbose=False, bvh=None,
     topo_chunk=500_000, tri_chunk=500_000,
+    remove_inner_faces=False,
 ):
     """Low-memory version of cumesh.remeshing.remesh_narrow_band_dc.
 
@@ -701,6 +744,45 @@ def remesh_narrow_band_dc_lowmem(
 
     mesh_vertices = (dual_verts / resolution - 0.5) * scale + center
 
+    # --- 5b. Quad-level inner face removal ---
+    if remove_inner_faces:
+        if verbose:
+            print(f"Removing inner quads from {quad_indices.shape[0]:,} quads...")
+        inner_chunk = 524_288
+        quad_centers = torch.empty((quad_indices.shape[0], 3), dtype=torch.float32, device=device)
+        for i in range(0, quad_indices.shape[0], inner_chunk):
+            end = min(i + inner_chunk, quad_indices.shape[0])
+            q = quad_indices[i:end].long()
+            quad_centers[i:end] = (
+                mesh_vertices[q[:, 0]] + mesh_vertices[q[:, 1]] +
+                mesh_vertices[q[:, 2]] + mesh_vertices[q[:, 3]]
+            ) * 0.25
+
+        sdf = torch.empty(quad_centers.shape[0], dtype=torch.float32, device=device)
+        for i in range(0, quad_centers.shape[0], inner_chunk):
+            end = min(i + inner_chunk, quad_centers.shape[0])
+            sdf[i:end] = bvh.signed_distance(quad_centers[i:end], mode='raystab')[0]
+
+        is_outer = sdf >= -eps * 0.1
+        n_removed = (~is_outer).sum().item()
+        quad_indices = quad_indices[is_outer]
+        intersected_dir = intersected_dir[is_outer]
+
+        # Re-index vertices to remove unused
+        used = torch.zeros(mesh_vertices.shape[0], dtype=torch.bool, device=device)
+        used[quad_indices.flatten()] = True
+        new_idx = torch.full((mesh_vertices.shape[0],), -1, dtype=torch.int32, device=device)
+        new_idx[used] = torch.arange(used.sum(), dtype=torch.int32, device=device)
+        mesh_vertices = mesh_vertices[used]
+        for i in range(0, quad_indices.shape[0], inner_chunk):
+            end = min(i + inner_chunk, quad_indices.shape[0])
+            quad_indices[i:end] = new_idx[quad_indices[i:end]]
+        L = quad_indices.shape[0]
+
+        if verbose:
+            print(f"  Removed {n_removed:,} inner quads, {L:,} remaining")
+        del quad_centers, sdf, is_outer, used, new_idx
+
     # --- 6. Chunked Triangle Splitting ---
     if verbose:
         print(f"Triangle splitting (chunked, {tri_chunk:,} quads/chunk)...")
@@ -758,8 +840,29 @@ def remesh_narrow_band_dc_lowmem(
     return mesh_vertices, mesh_triangles.int()
 
 
+def _batched_unsigned_distance(bvh, positions, batch_size=500_000, return_uvw=False):
+    """Batch unsigned_distance queries to avoid GPU kernel timeout on large meshes."""
+    import torch
+    N = positions.shape[0]
+    if N <= batch_size:
+        return bvh.unsigned_distance(positions, return_uvw=return_uvw)
+    distances_list, face_id_list, uvw_list = [], [], []
+    for i in range(0, N, batch_size):
+        end = min(i + batch_size, N)
+        d, f, u = bvh.unsigned_distance(positions[i:end], return_uvw=return_uvw)
+        distances_list.append(d)
+        face_id_list.append(f)
+        if return_uvw:
+            uvw_list.append(u)
+    return (
+        torch.cat(distances_list),
+        torch.cat(face_id_list),
+        torch.cat(uvw_list) if return_uvw else None,
+    )
+
+
 class Trellis2ExportGLB(io.ComfyNode):
-    """All-in-one: load voxelgrid NPZ -> simplify -> UV unwrap -> bake PBR -> export GLB."""
+    """Voxel data -> simplify -> UV unwrap -> bake PBR -> export GLB."""
 
     @classmethod
     def define_schema(cls):
@@ -768,28 +871,27 @@ class Trellis2ExportGLB(io.ComfyNode):
             display_name="TRELLIS.2 Export GLB",
             category="TRELLIS2",
             is_output_node=True,
-            description="""All-in-one textured GLB export from voxelgrid data.
+            description="""Textured GLB export from voxel data.
 
-Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
-1. Simplifies the mesh to decimation_target faces
-2. UV unwraps
-3. Bakes PBR textures (base_color, metallic, roughness) from voxel data
-4. Exports textured GLB to ComfyUI output folder
-
-Parameters:
-- voxelgrid_path: Path to .npz file from Shape to Textured Mesh
-- decimation_target: Target face count after simplification
-- texture_size: Resolution of baked PBR textures
-- remesh: Apply remeshing for cleaner topology before simplification
-- filename_prefix: Output filename prefix""",
+Takes voxel output from "Inference" node and:
+1. Optionally remeshes (Dual Contouring)
+2. Simplifies to decimation_target faces
+3. UV unwraps and bakes PBR textures
+4. Exports textured GLB""",
             inputs=[
-                io.String.Input("voxelgrid_path"),
+                io.Custom("TRELLIS2_VOXEL").Input("voxel",
+                    tooltip="Voxel data from Inference node."),
                 io.Int.Input("decimation_target", default=500000, min=1000, max=5000000, step=1000, optional=True),
                 io.Int.Input("texture_size", default=2048, min=512, max=8192, step=512, optional=True),
                 io.Boolean.Input("remesh", default=True, optional=True),
                 io.Boolean.Input("pre_simplify", default=True, optional=True,
                     tooltip="Pre-simplify mesh before remesh to massively reduce VRAM. May lose very thin features."),
-                io.Boolean.Input("use_vb", default=True, optional=True),
+                io.Boolean.Input("use_pytorch3d", default=False, optional=True,
+                    tooltip="Use pytorch3d for UV rasterization instead of nvdiffrast."),
+                io.Boolean.Input("remove_inner_faces", default=False, optional=True,
+                    tooltip="Remove faces whose centers are inside the original mesh (removes internal geometry artifacts)."),
+                io.Boolean.Input("double_sided", default=False, optional=True,
+                    tooltip="Mark material as double-sided in GLB (renders both front and back faces)."),
                 io.String.Input("filename_prefix", default="trellis2", optional=True),
             ],
             outputs=[
@@ -800,47 +902,44 @@ Parameters:
     @classmethod
     def execute(
         cls,
-        voxelgrid_path,
+        voxel,
         decimation_target=500000,
         texture_size=2048,
         remesh=True,
         pre_simplify=True,
-        use_vb=True,
+        use_pytorch3d=False,
+        remove_inner_faces=False,
+        double_sided=False,
         filename_prefix="trellis2",
     ):
-        import json
         import torch
-        if use_vb:
-            from o_voxel_vb.postprocess import to_glb
-            logger.info("ExportGLB: using o_voxel_vb")
-        else:
-            from o_voxel.postprocess import to_glb
-            logger.info("ExportGLB: using o_voxel (upstream)")
+        import cv2
+        import cumesh as CuMesh
+        from flex_gemm.ops.grid_sample import grid_sample_3d
+        import trimesh as Trimesh
 
         torch.cuda.empty_cache()
 
-        logger.info(f"ExportGLB: loading {voxelgrid_path}")
-        data = np.load(voxelgrid_path, allow_pickle=True)
+        # --- 1. Extract tensors from voxel dict ---
+        vertices = voxel['vertices'].float() if torch.is_tensor(voxel['vertices']) else torch.tensor(voxel['vertices']).float()
+        faces = voxel['faces'].int() if torch.is_tensor(voxel['faces']) else torch.tensor(voxel['faces']).int()
+        coords = voxel['coords'].float() if torch.is_tensor(voxel['coords']) else torch.tensor(voxel['coords']).float()
+        attr_volume = voxel['attrs'].float() if torch.is_tensor(voxel['attrs']) else torch.tensor(voxel['attrs']).float()
+        voxel_size_f = float(voxel['voxel_size'])
+        attr_layout = voxel['layout']
 
-        vertices = torch.tensor(data['vertices'].astype(np.float32))
-        faces = torch.tensor(data['faces'].astype(np.int32))
-        coords = torch.tensor(data['coords'].astype(np.float32))
-        attrs = torch.tensor(data['attrs'].astype(np.float32))
-        voxel_size_raw = data['voxel_size']
-        voxel_size = float(voxel_size_raw[0]) if hasattr(voxel_size_raw, '__len__') else float(voxel_size_raw)
-
-        layout_raw = json.loads(str(data['layout']))
-        attr_layout = {k: slice(v[0], v[1]) for k, v in layout_raw.items()}
-
-        logger.info(f"{vertices.shape[0]} verts, {faces.shape[0]} faces, {coords.shape[0]} voxels")
+        logger.info(f"ExportGLB: {vertices.shape[0]} verts, {faces.shape[0]} faces, {coords.shape[0]} voxels")
 
         comfy.model_management.throw_exception_if_processing_interrupted()
-
         device = comfy.model_management.get_torch_device()
 
-        # Pre-simplify before remesh to reduce BVH/simplify cost
+        # Compute grid size from voxel_size
+        aabb = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=torch.float32, device=device)
+        voxel_size = torch.tensor([voxel_size_f] * 3, dtype=torch.float32, device=device)
+        grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+
+        # --- 2. Pre-simplify before remesh ---
         if pre_simplify and remesh and faces.shape[0] > 2_000_000:
-            import cumesh as CuMesh
             logger.info(f"Pre-simplifying {faces.shape[0]} faces -> 2M before remesh")
             premesh = CuMesh.CuMesh()
             premesh.init(vertices.to(device), faces.to(device))
@@ -851,10 +950,8 @@ Parameters:
             torch.cuda.empty_cache()
             logger.info(f"Pre-simplified: {vertices.shape[0]} verts, {faces.shape[0]} faces")
 
-        # Run our low-mem DC instead of letting to_glb do it
+        # --- 3. DC remesh ---
         if remesh:
-            aabb = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=torch.float32, device=device)
-            grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
             dc_resolution = grid_size.max().item()
             dc_center = aabb.mean(dim=0)
             dc_scale = (aabb[1] - aabb[0]).max().item()
@@ -870,29 +967,238 @@ Parameters:
                 project_back=0.9,
                 verbose=True,
             )
-            # Replace mesh with remeshed version
             vertices = new_verts.cpu()
             faces = new_faces.cpu()
             del new_verts, new_faces
             torch.cuda.empty_cache()
             logger.info(f"Remeshed: {vertices.shape[0]} verts, {faces.shape[0]} faces")
 
-        # Pass remesh=False since we already did it (or user didn't want it)
-        textured_mesh = to_glb(
-            vertices=vertices.to(device),
-            faces=faces.to(device),
-            attr_volume=attrs.to(device),
-            coords=coords.to(device),
-            attr_layout=attr_layout,
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            voxel_size=voxel_size,
-            decimation_target=decimation_target,
-            texture_size=texture_size,
-            remesh=False,
+        # --- 4. Fill holes + Build BVH from current mesh ---
+        vertices = vertices.to(device)
+        faces = faces.to(device)
+
+        mesh = CuMesh.CuMesh()
+        mesh.init(vertices, faces)
+        mesh.fill_holes(max_hole_perimeter=3e-2)
+        vertices, faces = mesh.read()
+        logger.info(f"After fill holes: {mesh.num_vertices} verts, {mesh.num_faces} faces")
+
+        # --- 5. Build BVH from original (pre-simplify) mesh for accurate attribute lookup ---
+        orig_vertices = vertices.clone()
+        orig_faces = faces.clone()
+        bvh = CuMesh.cuBVH(orig_vertices, orig_faces)
+
+        comfy.model_management.throw_exception_if_processing_interrupted()
+
+        # --- 6. Simplify + cleanup ---
+        if not remesh:
+            # No-remesh: aggressive simplify → cleanup → final simplify → cleanup
+            mesh.simplify(decimation_target * 3, verbose=True)
+            logger.info(f"After initial simplify: {mesh.num_vertices} verts, {mesh.num_faces} faces")
+            mesh.remove_duplicate_faces()
+            mesh.repair_non_manifold_edges()
+            mesh.remove_small_connected_components(1e-5)
+            mesh.fill_holes(max_hole_perimeter=3e-2)
+            mesh.simplify(decimation_target, verbose=True)
+            logger.info(f"After final simplify: {mesh.num_vertices} verts, {mesh.num_faces} faces")
+            mesh.remove_duplicate_faces()
+            mesh.repair_non_manifold_edges()
+            mesh.remove_small_connected_components(1e-5)
+            mesh.fill_holes(max_hole_perimeter=3e-2)
+            mesh.unify_face_orientations()
+        else:
+            # Remesh: just simplify (DC already cleaned topology)
+            mesh.simplify(decimation_target, verbose=True)
+            logger.info(f"After simplify: {mesh.num_vertices} verts, {mesh.num_faces} faces")
+
+        # --- 7. Remove inner faces (optional) ---
+        if remove_inner_faces:
+            logger.info("Removing inner faces...")
+            out_v, out_f = mesh.read()
+            face_centers = (out_v[out_f[:, 0].long()] + out_v[out_f[:, 1].long()] + out_v[out_f[:, 2].long()]) / 3.0
+            chunk_size = 524_288
+            signed_dists = torch.empty(face_centers.shape[0], dtype=torch.float32, device=device)
+            for ci in range(0, face_centers.shape[0], chunk_size):
+                end = min(ci + chunk_size, face_centers.shape[0])
+                signed_dists[ci:end] = bvh.signed_distance(face_centers[ci:end], mode='raystab')[0]
+            eps = (aabb[1] - aabb[0]).max().item() / grid_size.max().item()
+            is_outer = signed_dists >= -eps * 0.1
+            n_removed = (~is_outer).sum().item()
+            if n_removed > 0:
+                mesh.remove_faces(~is_outer)
+                mesh.remove_unreferenced_vertices()
+            logger.info(f"Removed {n_removed} inner faces, {mesh.num_faces} remaining")
+
+        comfy.model_management.throw_exception_if_processing_interrupted()
+
+        # --- 8. UV unwrap ---
+        logger.info("UV unwrapping...")
+        out_vertices, out_faces, out_uvs, out_vmaps = mesh.uv_unwrap(
+            compute_charts_kwargs={
+                "threshold_cone_half_angle_rad": np.radians(90.0),
+                "refine_iterations": 0,
+                "global_iterations": 1,
+                "smooth_strength": 1,
+            },
+            return_vmaps=True,
             verbose=True,
         )
+        out_vertices = out_vertices.to(device)
+        out_faces = out_faces.to(device)
+        out_uvs = out_uvs.to(device)
+        out_vmaps = out_vmaps.to(device)
+        mesh.compute_vertex_normals()
+        out_normals = mesh.read_vertex_normals()[out_vmaps]
+        logger.info(f"UV unwrap done: {out_vertices.shape[0]} verts, {out_faces.shape[0]} faces")
 
-        # Export
+        comfy.model_management.throw_exception_if_processing_interrupted()
+
+        # --- 9. Rasterize in UV space ---
+        logger.info("Rasterizing UV space...")
+        if use_pytorch3d:
+            from pytorch3d.structures import Meshes
+            from pytorch3d.renderer.mesh.rasterize_meshes import rasterize_meshes
+
+            verts_uv = torch.cat([out_uvs * 2 - 1, torch.ones_like(out_uvs[:, :1])], dim=-1).float()
+            rast_mask = torch.zeros(texture_size, texture_size, dtype=torch.bool, device=device)
+            rast_face_ids = torch.full((texture_size, texture_size), -1, dtype=torch.long, device=device)
+            rast_bary = torch.zeros(texture_size, texture_size, 3, dtype=torch.float32, device=device)
+
+            chunk_size = 100_000
+            for i in range(0, out_faces.shape[0], chunk_size):
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                chunk_faces = out_faces[i:i+chunk_size].long()
+                meshes = Meshes(verts=[verts_uv], faces=[chunk_faces])
+                pix_to_face, _, bary_coords, _ = rasterize_meshes(
+                    meshes, image_size=texture_size,
+                    faces_per_pixel=1, perspective_correct=False,
+                    cull_backfaces=False, bin_size=0,
+                )
+                chunk_hit = pix_to_face[0, :, :, 0] >= 0
+                chunk_face_ids = pix_to_face[0, :, :, 0] + i
+                rast_face_ids = torch.where(chunk_hit, chunk_face_ids, rast_face_ids)
+                rast_bary[chunk_hit] = bary_coords[0, :, :, 0][chunk_hit]
+                rast_mask |= chunk_hit
+                del meshes, pix_to_face, bary_coords, chunk_hit, chunk_face_ids
+
+            del verts_uv
+            torch.cuda.synchronize()
+
+            # pytorch3d pixel order is flipped on both axes vs nvdiffrast
+            rast_mask = rast_mask.flip(0).flip(1)
+            rast_face_ids = rast_face_ids.flip(0).flip(1)
+            rast_bary = rast_bary.flip(0).flip(1)
+
+            mask = rast_mask
+            face_verts = out_vertices[out_faces[rast_face_ids[mask]].long()]
+            valid_pos = (face_verts * rast_bary[mask].unsqueeze(-1)).sum(dim=1)
+            del rast_face_ids, rast_bary, rast_mask, face_verts
+        else:
+            import nvdiffrast.torch as dr
+
+            ctx = dr.RasterizeCudaContext()
+            uvs_rast = torch.cat([
+                out_uvs * 2 - 1,
+                torch.zeros_like(out_uvs[:, :1]),
+                torch.ones_like(out_uvs[:, :1]),
+            ], dim=-1).unsqueeze(0)
+            rast = torch.zeros((1, texture_size, texture_size, 4), device=device, dtype=torch.float32)
+
+            chunk_size = 100_000
+            for i in range(0, out_faces.shape[0], chunk_size):
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                rast_chunk, _ = dr.rasterize(
+                    ctx, uvs_rast, out_faces[i:i+chunk_size],
+                    resolution=[texture_size, texture_size],
+                )
+                mask_chunk = rast_chunk[..., 3:4] > 0
+                rast_chunk[..., 3:4] += i
+                rast = torch.where(mask_chunk, rast_chunk, rast)
+                del rast_chunk, mask_chunk
+
+            del ctx, uvs_rast
+
+            mask = rast[0, ..., 3] > 0
+            pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
+            valid_pos = pos[mask]
+            del rast, pos
+
+        comfy.model_management.soft_empty_cache()
+
+        # --- 10. BVH map to original surface ---
+        logger.info("Mapping to original surface...")
+        _, face_id, uvw = _batched_unsigned_distance(bvh, valid_pos, return_uvw=True)
+        orig_tri_verts = orig_vertices[orig_faces[face_id.long()]]
+        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+        del face_id, uvw, orig_tri_verts
+
+        # --- 11. Sample voxel attributes ---
+        logger.info("Sampling PBR attributes...")
+        coords = coords.to(device)
+        attr_volume = attr_volume.to(device)
+
+        attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=device)
+        attrs[mask] = grid_sample_3d(
+            attr_volume,
+            torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
+            shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
+            grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            mode='trilinear',
+        )
+
+        del valid_pos, bvh, orig_vertices, orig_faces, attr_volume, coords
+        comfy.model_management.soft_empty_cache()
+
+        # --- 12. Inpaint UV seams ---
+        logger.info("Inpainting UV seams...")
+        mask_np = mask.cpu().numpy()
+        mask_inv = (~mask_np).astype(np.uint8)
+
+        base_color = np.clip(attrs[..., attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+
+        del attrs, mask
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+
+        base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+        metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+
+        # --- 13. Build PBR material ---
+        material = Trimesh.visual.material.PBRMaterial(
+            baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
+            baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+            metallicRoughnessTexture=Image.fromarray(np.concatenate([np.zeros_like(metallic), roughness, metallic], axis=-1)),
+            metallicFactor=1.0,
+            roughnessFactor=1.0,
+            alphaMode='OPAQUE',
+            doubleSided=double_sided,
+        )
+
+        # --- 14. Coordinate conversion Y-up → Z-up ---
+        vertices_np = out_vertices.cpu().numpy()
+        faces_np = out_faces.cpu().numpy()
+        uvs_np = out_uvs.cpu().numpy()
+        normals_np = out_normals.cpu().numpy()
+
+        vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2].copy(), -vertices_np[:, 1].copy()
+        normals_np[:, 1], normals_np[:, 2] = normals_np[:, 2].copy(), -normals_np[:, 1].copy()
+        uvs_np[:, 1] = 1 - uvs_np[:, 1]
+
+        # --- 15. Assemble trimesh ---
+        textured_mesh = Trimesh.Trimesh(
+            vertices=vertices_np,
+            faces=faces_np,
+            vertex_normals=normals_np,
+            process=False,
+            visual=Trimesh.visual.TextureVisuals(uv=uvs_np, material=material),
+        )
+
+        # --- 16. Export GLB ---
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{filename_prefix}_{timestamp}.glb"
         output_dir = folder_paths.get_output_directory()
@@ -901,8 +1207,7 @@ Parameters:
         textured_mesh.export(output_path, file_type='glb')
         logger.info(f"GLB exported: {output_path}")
 
-        # Cleanup
-        del vertices, faces, coords, attrs, textured_mesh
+        del textured_mesh, out_vertices, out_faces, out_uvs, out_normals, mesh
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
