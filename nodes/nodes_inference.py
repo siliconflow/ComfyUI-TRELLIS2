@@ -74,12 +74,7 @@ class Trellis2ImageToShape(io.ComfyNode):
             category="TRELLIS2",
             description="""Generate 3D shape from image conditioning.
 
-This node generates shape geometry (no texture/PBR).
-Connect shape_result to "Shape to Mesh" to extract the mesh,
-or to "Shape to Textured Mesh" for PBR materials.
-
-Returns:
-- shape_result: Shape data for downstream nodes""",
+Returns mesh, shape_slat (for texture generation), and subs (subdivision guides).""",
             inputs=[
                 io.Custom("TRELLIS2_MODEL_CONFIG").Input("model_config",
                     tooltip="Model config from Load TRELLIS.2 Models node"),
@@ -108,7 +103,9 @@ Returns:
                                  tooltip="Use o_voxel_vb (tiled decoder) vs o_voxel (upstream). Toggle to A/B test mesh extraction."),
             ],
             outputs=[
-                io.Custom("TRELLIS2_SHAPE_RESULT").Output(display_name="shape_result"),
+                io.Custom("TRIMESH").Output(display_name="mesh"),
+                io.Custom("TRELLIS2_SHAPE_SLAT").Output(display_name="shape_slat"),
+                io.Custom("TRELLIS2_SUBS").Output(display_name="subs"),
             ],
         )
 
@@ -127,13 +124,15 @@ Returns:
         max_tokens=49152,
         use_vb=True,
     ):
+        import numpy as np
+        import trimesh as Trimesh
         from .stages import run_shape_generation
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
         import torch
         with torch.inference_mode():
-            shape_result = run_shape_generation(
+            mesh_verts, mesh_faces, shape_slat_data, subs_data = run_shape_generation(
                 model_config=model_config,
                 conditioning=conditioning,
                 seed=seed,
@@ -147,11 +146,17 @@ Returns:
                 use_vb=use_vb,
             )
 
-        return io.NodeOutput(shape_result)
+        # Convert to trimesh with Y-up -> Z-up coordinate swap
+        vertices = mesh_verts.numpy().astype(np.float32)
+        faces = mesh_faces.numpy()
+        vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
+        mesh = Trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+        return io.NodeOutput(mesh, shape_slat_data, subs_data)
 
 
 class Trellis2ShapeToTexturedMesh(io.ComfyNode):
-    """Generate PBR textured mesh from shape using TRELLIS.2."""
+    """Generate PBR voxel texture from shape latent using TRELLIS.2."""
 
     @classmethod
     def define_schema(cls):
@@ -159,20 +164,19 @@ class Trellis2ShapeToTexturedMesh(io.ComfyNode):
             node_id="Trellis2ShapeToTexturedMesh",
             display_name="TRELLIS.2 Shape to Textured Mesh",
             category="TRELLIS2",
-            description="""Generate PBR textured mesh from shape.
+            description="""Generate PBR voxel texture from shape latent.
 
-Takes shape_result from "Image to Shape" and generates PBR materials
-(base_color, metallic, roughness, alpha) stored as a voxelgrid .npz.
-
-Returns:
-- voxelgrid_npz_path: Path to voxelgrid data (.npz)""",
+Takes shape_slat and subs from "Image to Shape" and generates PBR materials
+(base_color, metallic, roughness, alpha) as a voxel grid.""",
             inputs=[
                 io.Custom("TRELLIS2_MODEL_CONFIG").Input("model_config",
                     tooltip="Model config from Load TRELLIS.2 Models node"),
                 io.Custom("TRELLIS2_CONDITIONING").Input("conditioning",
                     tooltip="Image conditioning from Get Conditioning node (same as used for shape)"),
-                io.Custom("TRELLIS2_SHAPE_RESULT").Input("shape_result",
-                    tooltip="Shape result from Image to Shape node"),
+                io.Custom("TRELLIS2_SHAPE_SLAT").Input("shape_slat",
+                    tooltip="Shape structured latent from Image to Shape node"),
+                io.Custom("TRELLIS2_SUBS").Input("subs",
+                    tooltip="Subdivision guides from Image to Shape node"),
                 io.Int.Input("seed", default=0, min=0, max=2**31 - 1, optional=True,
                              tooltip="Random seed for texture variation"),
                 io.Float.Input("tex_guidance_strength", default=3.0, min=0.0, max=99.99, step=0.01, optional=True,
@@ -183,7 +187,7 @@ Returns:
                              tooltip="Texture sampling steps. More steps = better quality but slower"),
             ],
             outputs=[
-                io.String.Output(display_name="voxelgrid_npz_path"),
+                io.Custom("TRELLIS2_VOXELGRID").Output(display_name="voxelgrid"),
             ],
         )
 
@@ -192,61 +196,31 @@ Returns:
         cls,
         model_config,
         conditioning,
-        shape_result,
+        shape_slat,
+        subs,
         seed=0,
         tex_guidance_strength=3.0,
         tex_guidance_rescale=0.20,
         tex_sampling_steps=12,
     ):
-        # All heavy imports happen inside subprocess
-        import json
-        import os
-        import uuid
-        import numpy as np
         from .stages import run_texture_generation
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
         import torch
         with torch.inference_mode():
-            texture_result = run_texture_generation(
+            voxelgrid = run_texture_generation(
                 model_config=model_config,
                 conditioning=conditioning,
-                shape_result=shape_result,
+                shape_slat_data=shape_slat,
+                subs_data=subs,
                 seed=seed,
                 tex_guidance_strength=tex_guidance_strength,
                 tex_guidance_rescale=tex_guidance_rescale,
                 tex_sampling_steps=tex_sampling_steps,
             )
 
-        # Create output directory
-        cache_dir = '/tmp/trellis2_cache'
-        os.makedirs(cache_dir, exist_ok=True)
-        file_id = uuid.uuid4().hex[:8]
-
-        # Convert layout slices to tuples for JSON serialization
-        pbr_layout = texture_result['pbr_layout']
-        layout_serializable = {k: (v.start, v.stop) for k, v in pbr_layout.items()}
-
-        # Save voxelgrid data to .npz (contains mesh + PBR voxel data)
-        voxelgrid_npz_path = os.path.join(cache_dir, f'voxelgrid_{file_id}.npz')
-        np.savez(
-            voxelgrid_npz_path,
-            coords=texture_result['voxel_coords'],
-            attrs=texture_result['voxel_attrs'],
-            voxel_size=np.array([texture_result['voxel_size']]),
-            vertices=texture_result['original_vertices'],
-            faces=texture_result['original_faces'],
-            layout=json.dumps(layout_serializable),
-        )
-        log.info(f"Voxelgrid saved to: {voxelgrid_npz_path}")
-
-        # Release worker CUDA cache so ExportGLB has headroom
-        del texture_result
-        import gc; gc.collect()
-        torch.cuda.empty_cache()
-
-        return io.NodeOutput(voxelgrid_npz_path)
+        return io.NodeOutput(voxelgrid)
 
 
 class Trellis2RemoveBackground(io.ComfyNode):
@@ -495,7 +469,7 @@ Parameters:
                              tooltip="Texture sampling steps"),
             ],
             outputs=[
-                io.String.Output(display_name="voxelgrid_npz_path"),
+                io.Custom("TRELLIS2_VOXELGRID").Output(display_name="voxelgrid"),
             ],
         )
 
@@ -510,17 +484,13 @@ Parameters:
         tex_guidance_rescale=0.20,
         tex_sampling_steps=12,
     ):
-        import json
-        import os
-        import uuid
-        import numpy as np
         import torch
         from .stages import run_texture_mesh
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
         with torch.inference_mode():
-            texture_result = run_texture_mesh(
+            voxelgrid = run_texture_mesh(
                 model_config=model_config,
                 conditioning=conditioning,
                 shape_latent=shape_latent,
@@ -530,27 +500,7 @@ Parameters:
                 tex_sampling_steps=tex_sampling_steps,
             )
 
-        # Save voxelgrid NPZ (same format as existing ShapeToTexturedMesh)
-        cache_dir = '/tmp/trellis2_cache'
-        os.makedirs(cache_dir, exist_ok=True)
-        file_id = uuid.uuid4().hex[:8]
-
-        pbr_layout = texture_result['pbr_layout']
-        layout_serializable = {k: (v.start, v.stop) for k, v in pbr_layout.items()}
-
-        voxelgrid_npz_path = os.path.join(cache_dir, f'voxelgrid_retex_{file_id}.npz')
-        np.savez(
-            voxelgrid_npz_path,
-            coords=texture_result['voxel_coords'],
-            attrs=texture_result['voxel_attrs'],
-            voxel_size=np.array([texture_result['voxel_size']]),
-            vertices=texture_result['original_vertices'],
-            faces=texture_result['original_faces'],
-            layout=json.dumps(layout_serializable),
-        )
-        log.info(f"Retexture voxelgrid saved to: {voxelgrid_npz_path}")
-
-        return io.NodeOutput(voxelgrid_npz_path)
+        return io.NodeOutput(voxelgrid)
 
 
 class Trellis2RefineMesh(io.ComfyNode):
@@ -569,8 +519,7 @@ Takes an encoded mesh shape latent and:
 2. Re-samples a new shape latent at those coordinates
 3. Decodes to a refined mesh with improved geometric detail
 
-The output shape_result is compatible with the existing "Shape to Textured Mesh"
-node for full PBR texturing with subdivision guidance.
+Outputs mesh, shape_slat, and subs — compatible with "Shape to Textured Mesh".
 
 Parameters:
 - model_config: Loaded model config
@@ -601,7 +550,9 @@ Parameters:
                                  tooltip="Use tiled decoder (o_voxel_vb) vs upstream (o_voxel)"),
             ],
             outputs=[
-                io.Custom("TRELLIS2_SHAPE_RESULT").Output(display_name="shape_result"),
+                io.Custom("TRIMESH").Output(display_name="mesh"),
+                io.Custom("TRELLIS2_SHAPE_SLAT").Output(display_name="shape_slat"),
+                io.Custom("TRELLIS2_SUBS").Output(display_name="subs"),
             ],
         )
 
@@ -618,13 +569,15 @@ Parameters:
         max_tokens=49152,
         use_vb=True,
     ):
+        import numpy as np
         import torch
+        import trimesh as Trimesh
         from .stages import run_refine_mesh
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
         with torch.inference_mode():
-            shape_result = run_refine_mesh(
+            mesh_verts, mesh_faces, shape_slat_data, subs_data = run_refine_mesh(
                 model_config=model_config,
                 conditioning=conditioning,
                 shape_latent=shape_latent,
@@ -636,27 +589,33 @@ Parameters:
                 use_vb=use_vb,
             )
 
-        return io.NodeOutput(shape_result)
+        # Convert to trimesh with Y-up -> Z-up coordinate swap
+        vertices = mesh_verts.numpy().astype(np.float32)
+        faces = mesh_faces.numpy()
+        vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
+        mesh = Trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+        return io.NodeOutput(mesh, shape_slat_data, subs_data)
 
 
 class Trellis2ShapeToMesh(io.ComfyNode):
-    """Extract mesh from shape_result with optional simplification."""
+    """Simplify and/or fill holes in a mesh."""
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="Trellis2ShapeToMesh",
-            display_name="TRELLIS.2 Shape to Mesh",
+            display_name="TRELLIS.2 Simplify Mesh",
             category="TRELLIS2",
-            description="""Extract mesh from shape_result with optional simplification.
+            description="""Simplify mesh and/or fill holes.
 
 Parameters:
 - target_face_count: Target number of faces (0 = no simplification)
 - fill_holes: Fill small holes before simplifying
 - fill_holes_perimeter: Max hole perimeter to fill""",
             inputs=[
-                io.Custom("TRELLIS2_SHAPE_RESULT").Input("shape_result",
-                    tooltip="Shape result from Image to Shape or Refine Mesh node"),
+                io.Custom("TRIMESH").Input("trimesh",
+                    tooltip="Mesh from Image to Shape or other mesh source"),
                 io.Int.Input("target_face_count", default=200000, min=0, max=5000000, step=1000,
                     tooltip="Target face count. 0 = no simplification."),
                 io.Boolean.Input("fill_holes", default=False, optional=True),
@@ -668,14 +627,14 @@ Parameters:
         )
 
     @classmethod
-    def execute(cls, shape_result, target_face_count=0, fill_holes=True, fill_holes_perimeter=0.03):
+    def execute(cls, trimesh, target_face_count=0, fill_holes=True, fill_holes_perimeter=0.03):
         import numpy as np
         import trimesh as Trimesh
 
-        vertices = shape_result['raw_mesh_vertices'].numpy().astype(np.float32)
-        faces = shape_result['raw_mesh_faces'].numpy()
+        vertices = np.array(trimesh.vertices, dtype=np.float32)
+        faces = np.array(trimesh.faces)
 
-        log.info(f"ShapeToMesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
+        log.info(f"SimplifyMesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
 
         simplify = target_face_count > 0 and faces.shape[0] > target_face_count
 
@@ -684,7 +643,12 @@ Parameters:
             import cumesh as CuMesh
 
             device = comfy.model_management.get_torch_device()
-            verts_t = torch.tensor(vertices, dtype=torch.float32).to(device)
+
+            # Convert Z-up -> Y-up for cumesh, then back
+            verts_yup = vertices.copy()
+            verts_yup[:, 1], verts_yup[:, 2] = vertices[:, 2].copy(), -vertices[:, 1].copy()
+
+            verts_t = torch.tensor(verts_yup, dtype=torch.float32).to(device)
             faces_t = torch.tensor(faces, dtype=torch.int32).to(device)
 
             cumesh = CuMesh.CuMesh()
@@ -702,14 +666,14 @@ Parameters:
             vertices = out_v.cpu().numpy()
             faces = out_f.cpu().numpy()
 
+            # Y-up -> Z-up
+            vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
+
             del verts_t, faces_t, cumesh
             comfy.model_management.soft_empty_cache()
 
-        # Coordinate conversion Y-up -> Z-up
-        vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
-
         mesh = Trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        log.info(f"ShapeToMesh output: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+        log.info(f"SimplifyMesh output: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
 
         return io.NodeOutput(mesh)
 

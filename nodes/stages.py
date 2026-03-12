@@ -859,8 +859,7 @@ def run_shape_generation(
         max_num_tokens: Max tokens for 1024 cascade (lower = less VRAM)
 
     Returns:
-        Dict with shape_slat, subs, resolution, pipeline_type,
-        raw_mesh_vertices/faces for texture stage and mesh extraction
+        Tuple of (mesh_vertices, mesh_faces, shape_slat_data, subs_data)
     """
     import comfy.utils
     import cumesh as CuMesh
@@ -959,15 +958,10 @@ def run_shape_generation(
     raw_mesh_faces = raw_mesh_faces.cpu()
     del cumesh
 
-    # Pack results - serialize SparseTensor objects to dicts for IPC
-    result = {
-        'shape_slat': _serialize_for_ipc(shape_slat),
-        'subs': _serialize_for_ipc(subs),
-        'resolution': res,
-        'pipeline_type': resolution,
-        'raw_mesh_vertices': raw_mesh_vertices,
-        'raw_mesh_faces': raw_mesh_faces,
-    }
+    # Serialize SparseTensor objects to dicts for IPC
+    shape_slat_data = _serialize_for_ipc(shape_slat)
+    shape_slat_data['_resolution'] = res
+    subs_data = _serialize_for_ipc(subs)
 
     # Free GPU refs from locals that are now serialized
     del shape_slat, subs, meshes, mesh
@@ -976,13 +970,14 @@ def run_shape_generation(
 
     pbar.update(1)
     log.info(f"Shape generated: {raw_mesh_vertices.shape[0]} verts, {raw_mesh_faces.shape[0]} faces")
-    return result
+    return raw_mesh_vertices, raw_mesh_faces, shape_slat_data, subs_data
 
 
 def run_texture_generation(
     model_config: Any,
     conditioning: Dict[str, torch.Tensor],
-    shape_result: Dict[str, Any],
+    shape_slat_data: Dict[str, Any],
+    subs_data: Any,
     seed: int = 0,
     tex_guidance_strength: float = 3.0,
     tex_guidance_rescale: float = 0.20,
@@ -994,15 +989,15 @@ def run_texture_generation(
     Args:
         model_config: Trellis2ModelConfig
         conditioning: Dict with cond_512, neg_cond, optionally cond_1024
-        shape_result: Result from run_shape_generation
+        shape_slat_data: Serialized shape structured latent from run_shape_generation
+        subs_data: Serialized subdivision guides from run_shape_generation
         seed: Random seed
         tex_*: Texture sampling params
 
     Returns:
-        Dict with textured mesh data
+        Dict with voxel PBR data (coords, attrs, voxel_size, layout)
     """
     import comfy.utils
-    from .trellis2.vae import Mesh, MeshWithVoxel
 
     _init_config()
 
@@ -1013,27 +1008,19 @@ def run_texture_generation(
     compute_dtype = _DEFAULT_DTYPE
     resolution = model_config["resolution"]
 
-    # Move conditioning to device — keep float32 for sampling loop stability
+    # Move conditioning to device
     cond_on_device = {
         k: v.to(device=device, dtype=compute_dtype) if isinstance(v, torch.Tensor) else v
         for k, v in conditioning.items()
     }
 
     # Deserialize and move shape data to device
-    shape_slat = _deserialize_from_ipc(shape_result['shape_slat'], device)
-    subs = _deserialize_from_ipc(shape_result['subs'], device)
-    pipeline_type = shape_result['pipeline_type']
+    shape_slat = _deserialize_from_ipc(shape_slat_data, device)
+    subs = _deserialize_from_ipc(subs_data, device)
+    res = shape_slat_data['_resolution']
 
-    # Reconstruct Mesh objects from saved data
-    raw_vertices = shape_result['raw_mesh_vertices'].to(device)
-    raw_faces = shape_result['raw_mesh_faces'].to(device)
-    mesh = Mesh(vertices=raw_vertices, faces=raw_faces)
-    mesh.fill_holes()
-    meshes = [mesh]
-
-    # Determine texture model key
-    texture_resolution = TEXTURE_RESOLUTION_MAP.get(resolution, '1024_cascade')
-    if pipeline_type == '512':
+    # Determine texture model key from model_config
+    if resolution == '512':
         tex_model_key = 'tex_slat_flow_model_512'
         tex_cond = {'cond': cond_on_device['cond_512'], 'neg_cond': cond_on_device['neg_cond']}
     else:
@@ -1059,7 +1046,6 @@ def run_texture_generation(
         tex_params, device, compute_dtype,
     )
 
-    # Free shape_slat and cond — no longer needed
     del shape_slat, tex_cond, cond_on_device
     gc.collect()
     comfy.model_management.soft_empty_cache()
@@ -1075,33 +1061,19 @@ def run_texture_generation(
     log.info(f"Texture generation peak VRAM: {peak_mem:.0f} MB")
     pbar.update(1)
 
-    # Combine mesh with texture voxels (batch=0)
-    m = meshes[0]
+    # Extract voxel data (batch=0)
     v = tex_voxels[0]
-    m.fill_holes()
-    textured_mesh = MeshWithVoxel(
-        m.vertices, m.faces,
-        origin=[-0.5, -0.5, -0.5],
-        voxel_size=1 / shape_result['resolution'],
-        coords=v.coords[:, 1:],
-        attrs=v.feats,
-        voxel_shape=torch.Size([*v.shape, *v.spatial_shape]),
-        layout=_PBR_ATTR_LAYOUT,
-    )
-    textured_mesh.simplify(16777216)
+    voxel_size = 1.0 / res
 
     result = {
-        'voxel_coords': textured_mesh.coords.detach().cpu().numpy().astype(np.float32),
-        'voxel_attrs': textured_mesh.attrs.detach().cpu().numpy(),
-        'voxel_size': textured_mesh.voxel_size,
-        'pbr_layout': _PBR_ATTR_LAYOUT,
-        'original_vertices': textured_mesh.vertices.detach().cpu(),
-        'original_faces': textured_mesh.faces.detach().cpu(),
+        'coords': v.coords[:, 1:].detach().cpu().numpy().astype(np.float32),
+        'attrs': v.feats.detach().cpu().numpy(),
+        'voxel_size': voxel_size,
+        'layout': _PBR_ATTR_LAYOUT,
     }
 
     pbar.update(1)
-    coords = result['voxel_coords']
-    log.info(f"Texture generated: {textured_mesh.vertices.shape[0]} verts, {len(coords)} voxels")
+    log.info(f"Texture generated: {len(result['coords'])} voxels, voxel_size={voxel_size:.6f}")
     return result
 
 
@@ -1193,7 +1165,6 @@ def run_texture_mesh(
         Dict with voxel data for NPZ export (same format as run_texture_generation)
     """
     import comfy.utils
-    from .trellis2.vae import Mesh, MeshWithVoxel
 
     _init_config()
 
@@ -1264,36 +1235,19 @@ def run_texture_mesh(
     log.info(f"Standalone texture peak VRAM: {peak_mem:.0f} MB")
     pbar.update(1)
 
-    # Reconstruct mesh from preprocessed vertices/faces
-    prep_verts = shape_latent['preprocessed_vertices'].to(device)
-    prep_faces = shape_latent['preprocessed_faces'].to(device)
-    mesh = Mesh(vertices=prep_verts, faces=prep_faces)
-    mesh.fill_holes()
-
-    # Combine mesh with texture voxels (batch=0)
+    # Extract voxel data (batch=0)
     v = tex_voxels[0]
-    textured_mesh = MeshWithVoxel(
-        mesh.vertices, mesh.faces,
-        origin=[-0.5, -0.5, -0.5],
-        voxel_size=1 / enc_resolution,
-        coords=v.coords[:, 1:],
-        attrs=v.feats,
-        voxel_shape=torch.Size([*v.shape, *v.spatial_shape]),
-        layout=_PBR_ATTR_LAYOUT,
-    )
-    textured_mesh.simplify(16777216)
+    voxel_size = 1.0 / enc_resolution
 
     result = {
-        'voxel_coords': textured_mesh.coords.detach().cpu().numpy().astype(np.float32),
-        'voxel_attrs': textured_mesh.attrs.detach().cpu().numpy(),
-        'voxel_size': textured_mesh.voxel_size,
-        'pbr_layout': _PBR_ATTR_LAYOUT,
-        'original_vertices': textured_mesh.vertices.detach().cpu(),
-        'original_faces': textured_mesh.faces.detach().cpu(),
+        'coords': v.coords[:, 1:].detach().cpu().numpy().astype(np.float32),
+        'attrs': v.feats.detach().cpu().numpy(),
+        'voxel_size': voxel_size,
+        'layout': _PBR_ATTR_LAYOUT,
     }
 
     pbar.update(1)
-    log.info(f"Standalone texture generated: {len(result['voxel_coords'])} voxels")
+    log.info(f"Standalone texture generated: {len(result['coords'])} voxels")
     return result
 
 
@@ -1316,21 +1270,8 @@ def run_refine_mesh(
     at those coordinates using the shape flow model. The result is a new mesh
     with potentially improved geometric detail.
 
-    Returns TRELLIS2_SHAPE_RESULT (same format as run_shape_generation) so it
-    feeds directly into the existing Trellis2ShapeToTexturedMesh node.
-
-    Args:
-        model_config: Trellis2ModelConfig
-        conditioning: Dict with cond_512, neg_cond, optionally cond_1024
-        shape_latent: Result from run_encode_mesh (TRELLIS2_SHAPE_LATENT)
-        seed: Random seed
-        shape_guidance_strength: Shape CFG scale
-        shape_sampling_steps: Shape sampling steps
-        max_num_tokens: Token limit for HR resolution (lower = less VRAM)
-        use_vb: Use tiled decoder (o_voxel_vb)
-
     Returns:
-        shape_result dict (same format as run_shape_generation)
+        Tuple of (mesh_vertices, mesh_faces, shape_slat_data, subs_data)
     """
     import comfy.utils
     import cumesh as CuMesh
@@ -1471,16 +1412,11 @@ def run_refine_mesh(
     raw_mesh_faces = unified_faces.cpu()
     del cumesh, unified_verts, unified_faces
 
-    # Pack result (same format as run_shape_generation for ShapeToTexturedMesh compatibility)
-    result = {
-        'shape_slat': _serialize_for_ipc(shape_slat),
-        'subs': _serialize_for_ipc(subs),
-        'resolution': hr_resolution,
-        'pipeline_type': resolution,
-        'raw_mesh_vertices': raw_mesh_vertices,
-        'raw_mesh_faces': raw_mesh_faces,
-    }
+    # Serialize SparseTensor objects to dicts for IPC
+    shape_slat_data = _serialize_for_ipc(shape_slat)
+    shape_slat_data['_resolution'] = hr_resolution
+    subs_data = _serialize_for_ipc(subs)
 
     pbar.update(1)
     log.info(f"Mesh refined: {raw_mesh_vertices.shape[0]} verts, {raw_mesh_faces.shape[0]} faces")
-    return result
+    return raw_mesh_vertices, raw_mesh_faces, shape_slat_data, subs_data

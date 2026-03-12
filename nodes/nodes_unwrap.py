@@ -358,16 +358,6 @@ Parameters:
         voxel_size = voxelgrid['voxel_size']
         attr_layout = voxelgrid['layout']
 
-        orig_vertices = voxelgrid['original_vertices']
-        if isinstance(orig_vertices, np.ndarray):
-            orig_vertices = torch.from_numpy(orig_vertices)
-        orig_vertices = orig_vertices.to(device)
-
-        orig_faces = voxelgrid['original_faces']
-        if isinstance(orig_faces, np.ndarray):
-            orig_faces = torch.from_numpy(orig_faces)
-        orig_faces = orig_faces.to(device)
-
         # AABB
         aabb = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=torch.float32, device=device)
 
@@ -382,31 +372,16 @@ Parameters:
             grid_size = torch.tensor([1024, 1024, 1024], dtype=torch.int32, device=device)
             voxel_size = (aabb[1] - aabb[0]) / grid_size
 
-        # Build BVH from original mesh for accurate attribute lookup
-        logger.info("Building BVH...")
-        bvh = CuMesh.cuBVH(orig_vertices, orig_faces)
-
         logger.info("Rasterizing in UV space...")
 
         mask, valid_pos = _rasterize_uv(
             vertices_yup, faces, uvs, texture_size, device,
         )
 
-        # Map to original mesh
-        _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
-        orig_tri_verts = orig_vertices[orig_faces[face_id.long()]]
-        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-
-        # Map vertex positions to original mesh
-        logger.info("Mapping vertices to original mesh...")
-        _, vert_face_id, vert_uvw = bvh.unsigned_distance(vertices_yup, return_uvw=True)
-        vert_orig_tris = orig_vertices[orig_faces[vert_face_id.long()]]
-        vertices_mapped = (vert_orig_tris * vert_uvw.unsqueeze(-1)).sum(dim=1)
-
-        del bvh, face_id, uvw, orig_tri_verts, vert_face_id, vert_uvw, vert_orig_tris, vertices_yup
+        del vertices_yup
         comfy.model_management.soft_empty_cache()
 
-        # Sample voxel attributes for texture
+        # Sample voxel attributes for texture pixels
         logger.info("Sampling voxel attributes...")
         attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=device)
         attrs[mask] = grid_sample_3d(
@@ -417,19 +392,21 @@ Parameters:
             mode='trilinear',
         )
 
-        # Sample PBR attributes at mapped vertex positions
+        # Sample PBR attributes at vertex positions (Y-up)
         logger.info("Sampling vertex PBR attributes...")
+        verts_yup = vertices.clone()
+        verts_yup[:, 1], verts_yup[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
         vertex_pbr_attrs = grid_sample_3d(
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
             shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-            grid=((vertices_mapped - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            grid=((verts_yup - aabb[0]) / voxel_size).reshape(1, -1, 3),
             mode='trilinear',
         )[0]
 
         logger.info("Building PBR textures...")
 
-        del valid_pos, attr_volume, coords, vertices_mapped
+        del valid_pos, attr_volume, coords, verts_yup
         comfy.model_management.soft_empty_cache()
 
         mask_np = mask.cpu().numpy()
@@ -488,7 +465,7 @@ Parameters:
 
         logger.info(f"Rasterize complete: {texture_size}x{texture_size} PBR textures")
 
-        del vertices, faces, uvs, orig_vertices, orig_faces, vertex_pbr_attrs
+        del vertices, faces, uvs, vertex_pbr_attrs
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
