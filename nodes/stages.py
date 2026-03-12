@@ -91,9 +91,9 @@ def _encode_mesh_to_shape_slat(vertices, faces, resolution, device):
         shape_slat SparseTensor
     """
     from .trellis2.sparse import SparseTensor
-    import o_voxel
+    import o_voxel_vb_ap
 
-    voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
+    voxel_indices, dual_vertices, intersected = o_voxel_vb_ap.convert.mesh_to_flexible_dual_grid(
         vertices.cpu(),
         faces.cpu(),
         grid_size=resolution,
@@ -612,12 +612,11 @@ def _sample_shape_slat_cascade(
     return slat, hr_resolution
 
 
-def _decode_shape_slat(slat, resolution, dtype, use_vb=True):
+def _decode_shape_slat(slat, resolution, dtype):
     """Decode structured latent -> meshes + subs."""
     comfy.model_management.throw_exception_if_processing_interrupted()
     decoder = _load_model('shape_slat_decoder')
     decoder.set_resolution(resolution)
-    decoder.use_vb = use_vb
     decoder.low_vram = True  # Enable MLP chunking to reduce VRAM peak
     model_dtype = next(decoder.parameters()).dtype
     slat = slat.replace(feats=slat.feats.to(dtype=model_dtype))
@@ -845,7 +844,6 @@ def run_shape_generation(
     shape_guidance_rescale: float = 0.05,
     shape_sampling_steps: int = 12,
     max_num_tokens: int = 49152,
-    use_vb: bool = True,
 ) -> Dict[str, Any]:
     """
     Run shape generation.
@@ -862,7 +860,7 @@ def run_shape_generation(
         Tuple of (mesh_vertices, mesh_faces, shape_slat_data, subs_data)
     """
     import comfy.utils
-    import cumesh as CuMesh
+    import cumesh_vb as CuMesh
 
     _init_config()
 
@@ -938,7 +936,7 @@ def run_shape_generation(
 
     # 3. Decode shape
     comfy.model_management.throw_exception_if_processing_interrupted()
-    meshes, subs = _decode_shape_slat(shape_slat, res, compute_dtype, use_vb=use_vb)
+    meshes, subs = _decode_shape_slat(shape_slat, res, compute_dtype)
 
     peak_mem = torch.cuda.max_memory_allocated() / 1024**2
     log.info(f"Shape generation peak VRAM: {peak_mem:.0f} MB")
@@ -1260,7 +1258,6 @@ def run_refine_mesh(
     shape_guidance_rescale: float = 0.05,
     shape_sampling_steps: int = 12,
     max_num_tokens: int = 49152,
-    use_vb: bool = True,
 ) -> Dict[str, Any]:
     """
     Refine mesh geometry by re-sampling shape at higher resolution.
@@ -1274,7 +1271,7 @@ def run_refine_mesh(
         Tuple of (mesh_vertices, mesh_faces, shape_slat_data, subs_data)
     """
     import comfy.utils
-    import cumesh as CuMesh
+    import cumesh_vb as CuMesh
     from .trellis2.sparse import SparseTensor
     from .trellis2.samplers import FlowEulerGuidanceIntervalSampler
 
@@ -1395,7 +1392,7 @@ def run_refine_mesh(
 
     # Step 4: Decode shape -> mesh + subs
     comfy.model_management.throw_exception_if_processing_interrupted()
-    meshes, subs = _decode_shape_slat(shape_slat, hr_resolution, compute_dtype, use_vb=use_vb)
+    meshes, subs = _decode_shape_slat(shape_slat, hr_resolution, compute_dtype)
 
     peak_mem = torch.cuda.max_memory_allocated() / 1024**2
     log.info(f"Mesh refinement peak VRAM: {peak_mem:.0f} MB")

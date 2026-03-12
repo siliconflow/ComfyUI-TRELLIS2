@@ -69,7 +69,7 @@ Parameters:
         remesh_band=1.0,
     ):
         import torch
-        import cumesh as CuMesh
+        import cumesh_vb as CuMesh
         import trimesh as Trimesh
 
         logger.info(f"Simplify: {len(trimesh.vertices)} vertices, {len(trimesh.faces)} faces -> {target_face_count} target")
@@ -212,7 +212,7 @@ TIP: Simplify mesh first! UV unwrapping 10M faces takes forever.""",
         chart_smooth_strength=1,
     ):
         import torch
-        import cumesh as CuMesh
+        import cumesh_vb as CuMesh
         import trimesh as Trimesh
 
         logger.info(f"UV Unwrap: {len(trimesh.vertices)} vertices, {len(trimesh.faces)} faces")
@@ -317,8 +317,8 @@ Parameters:
     ):
         import torch
         import cv2
-        import cumesh as CuMesh
-        from flex_gemm.ops.grid_sample import grid_sample_3d
+        import cumesh_vb as CuMesh
+        from flex_gemm_ap.ops.grid_sample import grid_sample_3d
         import trimesh as Trimesh
 
         # Check for UVs
@@ -478,15 +478,15 @@ def remesh_narrow_band_dc_lowmem(
     topo_chunk=500_000, tri_chunk=500_000,
     remove_inner_faces=False,
 ):
-    """Low-memory version of cumesh.remeshing.remesh_narrow_band_dc.
+    """Low-memory version of cumesh_vb.remeshing.remesh_narrow_band_dc.
 
     Same algorithm but chunks the topology generation and triangle splitting
     steps to avoid materializing huge intermediate tensors.
     """
     import torch
-    from cumesh import _C
-    from cumesh.bvh import cuBVH
-    from cumesh.remeshing import _init_hashmap
+    from cumesh_vb import _C
+    from cumesh_vb.bvh import cuBVH
+    from cumesh_vb.remeshing import _init_hashmap
     from tqdm import tqdm
 
     device = vertices.device
@@ -880,8 +880,8 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
         import json
         import torch
         import cv2
-        import cumesh as CuMesh
-        from flex_gemm.ops.grid_sample import grid_sample_3d
+        import cumesh_vb as CuMesh
+        from flex_gemm_ap.ops.grid_sample import grid_sample_3d
         import trimesh as Trimesh
 
         torch.cuda.empty_cache()

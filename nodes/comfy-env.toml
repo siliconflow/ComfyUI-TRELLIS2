@@ -1,5 +1,5 @@
 [cuda]
-packages = ["flex_gemm", "flex_gemm_ap", "cumesh", "o_voxel", "o_voxel_vb", "torch", "torchvision", "flash-attn", "sageattention", "drtk"]
+packages = ["flex_gemm_ap", "cumesh_vb", "o_voxel_vb_ap", "torch", "torchvision", "flash-attn", "sageattention", "drtk"]
 
 [pypi-dependencies]
 # HuggingFace models

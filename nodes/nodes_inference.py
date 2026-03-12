@@ -99,8 +99,6 @@ Returns mesh, shape_slat (for texture generation), and subs (subdivision guides)
                 # VRAM Control
                 io.Int.Input("max_tokens", default=49152, min=16384, max=262144, step=4096, optional=True,
                              tooltip="Max tokens for 1024 cascade. Lower = less VRAM but potentially lower quality. Default 49152 (~9GB), try 32768 (~7GB) or 24576 (~6GB) for lower VRAM."),
-                io.Boolean.Input("use_vb", default=True, optional=True,
-                                 tooltip="Use o_voxel_vb (tiled decoder) vs o_voxel (upstream). Toggle to A/B test mesh extraction."),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="mesh"),
@@ -122,7 +120,6 @@ Returns mesh, shape_slat (for texture generation), and subs (subdivision guides)
         shape_guidance_rescale=0.05,
         shape_sampling_steps=12,
         max_tokens=49152,
-        use_vb=True,
     ):
         import numpy as np
         import trimesh as Trimesh
@@ -143,7 +140,6 @@ Returns mesh, shape_slat (for texture generation), and subs (subdivision guides)
                 shape_guidance_rescale=shape_guidance_rescale,
                 shape_sampling_steps=shape_sampling_steps,
                 max_num_tokens=max_tokens,
-                use_vb=use_vb,
             )
 
         # Convert to trimesh with Y-up -> Z-up coordinate swap
@@ -528,7 +524,7 @@ Parameters:
 - seed: Random seed
 - shape_*: Shape sampling parameters
 - max_tokens: VRAM limit control
-- use_vb: Toggle tiled vs upstream decoder""",
+""",
             inputs=[
                 io.Custom("TRELLIS2_MODEL_CONFIG").Input("model_config",
                     tooltip="Model config from Load TRELLIS.2 Models node"),
@@ -546,8 +542,6 @@ Parameters:
                              tooltip="Shape sampling steps"),
                 io.Int.Input("max_tokens", default=49152, min=16384, max=262144, step=4096, optional=True,
                              tooltip="Max tokens for HR resolution. Lower = less VRAM."),
-                io.Boolean.Input("use_vb", default=True, optional=True,
-                                 tooltip="Use tiled decoder (o_voxel_vb) vs upstream (o_voxel)"),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="mesh"),
@@ -567,7 +561,6 @@ Parameters:
         shape_guidance_rescale=0.05,
         shape_sampling_steps=12,
         max_tokens=49152,
-        use_vb=True,
     ):
         import numpy as np
         import torch
@@ -586,7 +579,6 @@ Parameters:
                 shape_guidance_rescale=shape_guidance_rescale,
                 shape_sampling_steps=shape_sampling_steps,
                 max_num_tokens=max_tokens,
-                use_vb=use_vb,
             )
 
         # Convert to trimesh with Y-up -> Z-up coordinate swap
@@ -640,7 +632,7 @@ Parameters:
 
         if simplify or fill_holes:
             import torch
-            import cumesh as CuMesh
+            import cumesh_vb as CuMesh
 
             device = comfy.model_management.get_torch_device()
 

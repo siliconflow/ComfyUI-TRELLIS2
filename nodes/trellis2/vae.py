@@ -1040,11 +1040,7 @@ class SparseUnetVaeDecoder(nn.Module):
 # Section 3: FlexiDualGrid VAE (from fdg_vae.py)
 # ============================================================================
 
-from o_voxel_vb.convert import tiled_flexible_dual_grid_to_mesh as _tiled_vb
-try:
-    from o_voxel.convert import flexible_dual_grid_to_mesh as _flex_upstream
-except ImportError:
-    _flex_upstream = None
+from o_voxel_vb_ap.convert import tiled_flexible_dual_grid_to_mesh as _tiled_vb
 import comfy.model_management as _cmm
 
 
@@ -1073,7 +1069,7 @@ class Mesh:
         return self.to('cpu')
 
     def fill_holes(self, max_hole_perimeter=3e-2):
-        import cumesh
+        import cumesh_vb as cumesh
         device = _cmm.get_torch_device()
         vertices = self.vertices.to(device)
         faces = self.faces.to(device)
@@ -1097,7 +1093,7 @@ class Mesh:
         self.faces = new_faces.to(self.device)
 
     def remove_faces(self, face_mask: torch.Tensor):
-        import cumesh
+        import cumesh_vb as cumesh
         device = _cmm.get_torch_device()
         vertices = self.vertices.to(device)
         faces = self.faces.to(device)
@@ -1109,7 +1105,7 @@ class Mesh:
         self.faces = new_faces.to(self.device)
 
     def simplify(self, target=1000000, verbose: bool = False, options: dict = {}):
-        import cumesh
+        import cumesh_vb as cumesh
         device = _cmm.get_torch_device()
         vertices = self.vertices.to(device)
         faces = self.faces.to(device)
@@ -1167,7 +1163,7 @@ class MeshWithVoxel(Mesh, Voxel):
         )
 
     def query_attrs(self, xyz):
-        from flex_gemm.ops.grid_sample import grid_sample_3d
+        from flex_gemm_ap.ops.grid_sample import grid_sample_3d
         grid = ((xyz - self.origin) / self.voxel_size).reshape(1, -1, 3)
         vertex_attrs = grid_sample_3d(
             self.attrs,
@@ -1256,9 +1252,6 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
     def set_resolution(self, resolution: int) -> None:
         self.resolution = resolution
 
-    # Toggle: True = o_voxel_vb (tiled), False = o_voxel (upstream)
-    use_vb: bool = True
-
     def forward(self, x: sp.SparseTensor, **kwargs):
         decoded = super().forward(x, **kwargs)
         out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
@@ -1285,29 +1278,16 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         extra = out_list[1:]
         del h, out_list
 
-        if self.use_vb:
-            mesh = [Mesh(*_tiled_vb(
-                coords=coords,
-                dual_vertices=v.feats,
-                intersected_flag=i.feats,
-                split_weight=q.feats,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                grid_size=self.resolution,
-                tile_size=128,
-                train=False,
-            )) for v, i, q in zip(vertices, intersected, quad_lerp)]
-        else:
-            if _flex_upstream is None:
-                raise ImportError("o_voxel is not installed — cannot use upstream decoder")
-            mesh = [Mesh(*_flex_upstream(
-                coords=coords,
-                dual_vertices=v.feats,
-                intersected_flag=i.feats,
-                split_weight=q.feats,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                grid_size=self.resolution,
-                train=False,
-            )) for v, i, q in zip(vertices, intersected, quad_lerp)]
+        mesh = [Mesh(*_tiled_vb(
+            coords=coords,
+            dual_vertices=v.feats,
+            intersected_flag=i.feats,
+            split_weight=q.feats,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            grid_size=self.resolution,
+            tile_size=128,
+            train=False,
+        )) for v, i, q in zip(vertices, intersected, quad_lerp)]
 
         del coords, vertices, intersected, quad_lerp
 
